@@ -1,4 +1,7 @@
 RedHat
 ======
 
-Red Hat
+Sharing at Red Hat
+ * Application Blueprints
+ * Re-usable Services
+ * Notes
