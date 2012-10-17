@@ -1,0 +1,223 @@
+#!/bin/bash -x
+(
+
+# This script will configure a system as a openshift broker. 
+# 
+# Author: jlabocki@redhat.com
+# Date:   10.15.12
+# reference blueprint: /RedHat/blueprints/openshift_broker
+#
+# Note that variables are mapped hard to application blueprints
+#
+# For example if the following parameter was in your application blueprint:
+#       <services>
+#        <service name="register_to_system_engine">
+#          <executable url="http://172.16.0.50/test.sh"/>
+#          <parameters>
+#            <parameter name="sehost">
+#              <value><![CDATA[systemengineFQDN]]></value>
+#            </parameter>
+#          </parameters>
+#        </service>
+#      </services>
+# Then you would reference it in your script like this:
+#  sehost=$AUDREY_VAR_register_to_system_engine_sehost
+#  echo "sehost: " $sehost
+
+# Set Variables from Audrey and hide some from the user
+env
+
+# Developer user and password
+ose_developer=$AUDREY_VAR_openshift_broker_developer
+ose_developer_password=$AUDREY_VAR_openshift_broker_developer_password
+
+# The administrator password for the administrative user created in mongodb
+admin_password=$AUDREY_VAR_openshift_broker_admin_password
+
+# Path to bind key file, we won't expose this to the user
+bind_key=http://ns1.rhc.lab.eng.bos.redhat.com/environment/keyfile
+
+# The domain
+ose_domain=$AUDREY_VAR_openshift_broker_ose_domain
+
+# DNS server
+name_server=$AUDREY_VAR_openshift_broker_name_server
+
+# Working Gemfile and Gemfile.lock (often useful)
+gemfile=http://${name_server}/environment/Gemfile
+gemfile_lock=http://${name_server}/environment/Gemfile.lock
+
+# Hostname
+my_hostname=`hostname`
+
+
+# Use the setsebool command to set a number of Boolean variables that are provided by the standard SELinux policy
+setsebool -P httpd_unified=on httpd_can_network_connect=on httpd_can_network_relay=on named_write_master_zones=on allow_ypbind=on
+
+# Use the semodule command to load the required OpenShift policy file
+semodule -i /usr/share/selinux/packages/rubygem-stickshift-common/stickshift.pp
+
+# You also need to disable the existing policy for passenger (an Apache module used internally by the broker application), and load the OpenShift policy for passenger
+semodule -d passenger
+semodule -i /usr/share/selinux/packages/rubygem-passenger/rubygem-passenger.pp
+
+# You now need to use the fixfiles and restorecon commands to relabel a number of files and directories with the correct SELinux contexts
+fixfiles -R rubygem-passenger restore
+fixfiles -R mod_passenger restore
+restorecon -rv /var/run
+restorecon -rv /usr/lib/ruby/gems/1.8/gems/passenger-*
+restorecon -rv /usr/sbin/mcollectived /var/log/mcollective.log /run/mcollective.pid
+
+# Configure mongodb.conf for authentication
+echo "smallfiles = true" >> /etc/mongodb.conf
+echo "auth = true" >> /etc/mongodb.conf
+
+# Start mongod
+service mongod start
+
+# sleep while mongo starts
+sleep 50
+
+# Now you need to create an initial user account; the broker uses this account to perform administrative tasks. Use the MongoDB addUser command to create this user 
+mongo stickshift_broker_dev --eval "db.addUser('stickshift', '$admin_password')"
+
+# change the development.rb file to match
+sed -i "s/:password => \"mooo\"/:password => \"${admin_password}\"/g" /var/www/stickshift/broker/config/environments/development.rb
+
+# Change the swingshift-mongo-plugin.rb to match
+sed -i "s/:mongo_password => \"mooo\"/:mongo_password => \"${admin_password}\"/g" /var/www/stickshift/broker/config/environments/plugin-config/swingshift-mongo-plugin.rb
+
+# Set the admin user here. I'm not sure how to generate the hash. It uses the salt
+# in /var/www/stickshift/broker/config/environments/plugin-config/swingshift-mongo-plugin.rb
+# This can be revisited with ldap auth implementation coming soon
+mongo stickshift_broker_dev --eval 'db.auth_user.update({"_id":"admin"}, {"_id":"admin","user":"admin","password":"2a8462d93a13e51387a5e607cbd1139f"}, true)'
+
+# Open firewall ports
+lokkit --service=ssh
+lokkit --service=https
+lokkit --service=http
+lokkit --service=dns
+lokkit --port=5672:tcp
+
+# Chkconfig on services 
+# I don't think there is a stickshift-proxy on the broker
+chkconfig httpd on
+chkconfig mongod on
+chkconfig network on
+chkconfig sshd on
+chkconfig stickshift-proxy on
+chkconfig named on
+chkconfig qpidd on
+chkconfig stickshift-broker on
+
+# Turn off mcollective. The broker is a client, the node is a server
+chkconfig mcollective off
+
+# Backup old /etc/mcollective/client.cfg
+mv /etc/mcollective/client.cfg /etc/mcollective/client.cfg.orig
+
+# Write a new /etc/mcollective/client.cfg
+# 
+cat <<EOF > /etc/mcollective/client.cfg
+topicprefix = /topic/
+main_collective = mcollective
+collectives = mcollective
+libdir = /usr/libexec/mcollective
+loglevel = debug
+logfile = /var/log/mcollective-client.log
+
+# Plugins
+securityprovider = psk
+plugin.psk = unset
+connector = qpid
+plugin.qpid.host=${my_hostname}
+plugin.qpid.secure=false
+plugin.qpid.timeout=5
+
+# Facts
+factsource = yaml
+plugin.yaml = /etc/mcollective/facts.yaml
+EOF
+
+# Turn off auth in qpidd.conf
+sed -i 's/auth=yes/auth=no/g' /etc/qpidd.conf
+
+# Grab bind keyfile from DNS server
+# I realize this is not ideal, patches welcome
+wget $bind_key -O /var/named/${ose_domain}.key
+
+# Set permissions and SELinux contexts approriately
+chown -Rv named:named /var/named
+restorecon -rv /var/named
+
+# We must configure OpenShift to use the plug-ins for MongoDB, BIND, and MCollective. First, let us configure OpenShift to load the Ruby modules that implement these plug-ins. OpenShift is built on Ruby on Rails, which relies on Bundler to manage Ruby modules, or "gems." Edit the file /var/www/stickshift/broker/Gemfile and find the line "# Add plugin gems here". After this line, insert the following lines: 
+sed -i "/Add plugin gems here/a  gem 'swingshift-mongo-plugin'" /var/www/stickshift/broker/Gemfile
+sed -i "/Add plugin gems here/a  gem 'uplift-bind-plugin'" /var/www/stickshift/broker/Gemfile
+sed -i "/Add plugin gems here/a  gem 'gearchanger-mcollective-plugin'" /var/www/stickshift/broker/Gemfile
+
+# The Uplift plug-in requires the "dnsruby" gem, so add the following line to the same file (you can add it after the above three lines): 
+sed -i "/swingshift-mongo-plugin/a gem 'dnsruby'" /var/www/stickshift/broker/Gemfile
+
+# Change to approriate directory
+cd /var/www/stickshift/broker
+
+# Get working gemfiles
+wget $gemfile -O /var/www/stickshift/broker/Gemfile
+wget $gemfile_lock -O /var/www/stickshift/broker/Gemfile.lock
+
+# Change the ansi-termcolor package date string otherwise bundle --local will fail
+sed -i 's/s.date = %q{2011-10-13 00:00:00.000000000Z}/s.date = %q{2011-10-13}/g' /usr/lib/ruby/gems/1.8/specifications/term-ansicolor-1.0.7.gemspec
+
+
+
+
+# Execute bundle local to lock gems
+bundle --local
+
+# Append the following lines to the end of /var/www/stickshift/broker/config/environments/development.rb
+echo "require File.expand_path('../plugin-config/swingshift-mongo-plugin.rb', __FILE__)" >> /var/www/stickshift/broker/config/environments/development.rb
+echo "require File.expand_path('../plugin-config/uplift-bind-plugin.rb', __FILE__)" >> /var/www/stickshift/broker/config/environments/development.rb
+echo "require File.expand_path('../plugin-config/gearchanger-mcollective-plugin.rb', __FILE__)" >> /var/www/stickshift/broker/config/environments/development.rb
+
+# The Uplift plug-in requires that an additional SELinux policy be compiled and installed using the make and semodule commands: 
+cd /usr/share/selinux/packages/rubygem-uplift-bind-plugin/
+make -f /usr/share/selinux/devel/Makefile
+semodule -i /usr/share/selinux/packages/rubygem-uplift-bind-plugin/dhcpnamedforward.pp
+
+# The Uplift plug-in itself must be configured to use the local BIND instance that we set up earlier. To do so, ensure that the configuration directory for plug-ins has been created: 
+mkdir -p /var/www/stickshift/broker/config/environments/plugin-config
+
+# Get KEY value for next command
+KEY=`cat /var/named/${ose_domain}.key  |grep -i secret |awk -F" " '{print $2}' |awk -F"\"" '{print $2}'`
+
+# Then create the /var/www/stickshift/broker/config/environments/plugin-config/uplift-bind-plugin.rb file using the following command: 
+cat <<EOF > /var/www/stickshift/broker/config/environments/plugin-config/uplift-bind-plugin.rb 
+Broker::Application.configure do
+  config.dns = {
+  :server => "${name_server}",
+  :port => 53,
+  :keyname => "${ose_domain}",
+  :keyvalue => "${KEY}",
+  :zone => "${ose_domain}"
+}
+end
+EOF
+
+# Set ownership and SELinux credentials
+chown -v apache:apache /var/www/stickshift/broker/config/environments/plugin-config/uplift-bind-plugin.rb
+restorecon /var/www/stickshift/broker/config/environments/plugin-config/uplift-bind-plugin.rb
+
+# We must also ensure that the rest of the OpenShift configuration files are modified to reflect your choice of domain name for this OpenShift installation: 
+perl -p -i -e "s/.*:domain_suffix.*/    :domain_suffix =>  \"${ose_domain}\",/" /var/www/stickshift/broker/config/environments/*.rb
+
+# Create a developer account
+ss-register-user --login admin --password admin --username ${ose_developer} --userpass ${ose_developer_password}
+
+
+# Reboot for good measure, turn off audrey before we do
+chkconfig ZZaudrey off
+reboot
+
+
+) 2>&1 | tee /var/audrey/tooling/openshift_broker.log
+

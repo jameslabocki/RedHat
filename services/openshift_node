@@ -1,0 +1,16 @@
+       <services>
+        <service name="openshift_node">
+          <executable url="http://172.16.0.50/RedHat/scripts/openshift_node"/>
+          <parameters>
+            <parameter name="ose_broker">
+              <value><![CDATA[host72.rhc.lab.eng.bos.redhat.com]]></value>
+            </parameter>
+            <parameter name="ose_domain">
+              <value><![CDATA[rhc.lab.eng.bos.redhat.com]]></value>
+            </parameter>
+            <parameter name="name_server">
+              <value><![CDATA[ns1.rhc.lab.eng.bos.redhat.com]]></value>
+            </parameter>
+          </parameters>
+        </service>
+      </services>

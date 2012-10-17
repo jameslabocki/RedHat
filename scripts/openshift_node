@@ -1,0 +1,134 @@
+#!/bin/bash -x
+(
+
+# This script will configure a system as a openshift node.
+# 
+# Author: jlabocki@redhat.com
+# Date:   10.15.12
+# reference blueprint: /RedHat/blueprints/openshift_node
+#
+# Note that variables are mapped hard to application blueprints
+#
+# For example if the following parameter was in your application blueprint:
+#       <services>
+#        <service name="register_to_system_engine">
+#          <executable url="http://172.16.0.50/test.sh"/>
+#          <parameters>
+#            <parameter name="sehost">
+#              <value><![CDATA[systemengineFQDN]]></value>
+#            </parameter>
+#          </parameters>
+#        </service>
+#      </services>
+# Then you would reference it in your script like this:
+#  sehost=$AUDREY_VAR_register_to_system_engine_sehost
+#  echo "sehost: " $sehost
+
+# Set Variables from Audrey and hide some from the user
+
+# OpenShift Broker we should register to
+ose_broker=$AUDREY_VAR_openshift_node_ose_broker
+
+# The domain
+ose_domain=$AUDREY_VAR_openshift_node_ose_domain
+
+# DNS server
+name_server=$AUDREY_VAR_openshift_node_name_server
+
+# Hostname
+my_hostname=`hostname`
+
+# Public IP this is not ideal and will only work on node with a single interface.
+public_ip=`ip addr |grep -i inet |grep -v inet6 |grep -v 127.0.0.1 |awk -F"/" '{print $1}' |awk -F" " '{print $2}'`
+
+
+# Configure SELinux policy for the node and fix SELinux contexts by running the following commands. Set Boolean values: 
+setsebool -P httpd_unified=on httpd_can_network_connect=on httpd_can_network_relay=on httpd_read_user_content=on httpd_enable_homedirs=on
+
+# Load the OpenShift policy file:
+semodule -i /usr/share/selinux/packages/rubygem-stickshift-common/stickshift.pp
+
+# Disable the old policy for passenger and load the OpenShift policy for passenger: 
+semodule -d passenger
+semodule -i /usr/share/selinux/packages/rubygem-passenger/rubygem-passenger.pp
+
+# Relabel files with the proper SELinux contexts: 
+fixfiles -R rubygem-passenger restore
+fixfiles -R mod_passenger restore
+restorecon -rv /var/run
+restorecon -rv /usr/lib/ruby/gems/1.8/gems/passenger-*
+restorecon -rv /usr/sbin/mcollectived /var/log/mcollective.log /run/mcollective.pid
+restorecon -rv /var/lib/stickshift /etc/stickshift/stickshift-node.conf /etc/httpd/conf.d/stickshift
+
+# Configure sysctl settings
+echo '/sbin/sysctl -w kernel.sem="250  32000 32  4096"' >> /etc/rc.local
+echo '/sbin/sysctl -w net.ipv4.ip_local_port_range="15000 35530"' >> /etc/rc.local
+echo '/sbin/sysctl -w net.netfilter.nf_conntrack_max="1048576"' >> /etc/rc.local
+
+# Append GIT_SSH Environment to sshd_config
+sed -i "/AcceptEnv XMODIFIERS/a  AcceptEnv GIT_SSH" /etc/ssh/sshd_config
+
+# The SSH server handles a high number of SSH connections from developers connecting to the node to push their changes. To accommodate this volume, increase the limits on the number of connections to the node by running the following commands: 
+perl -p -i -e "s/^#MaxSessions .*$/MaxSessions 40/" /etc/ssh/sshd_config
+perl -p -i -e "s/^#MaxStartups .*$/MaxStartups 40/" /etc/ssh/sshd_config
+
+# A symlink is used for interactive logins to provide a customized environment to developers. Create the symlink using the following command: 
+ln -s /usr/bin/sssh /usr/bin/rhcsh
+
+# Allow SSH for GIT access: Allow Web browsers to connect via HTTP and HTTPS to applications running on the node: Open the range of ports that are allocated for application use: Set the required system services to start when the node boots: 
+lokkit --service=ssh
+lokkit --service=https
+lokkit --service=http
+lokkit --port=35531-65535:tcp
+chkconfig httpd on
+chkconfig mcollective on
+chkconfig network on
+chkconfig sshd on
+chkconfig stickshift-proxy on
+
+# Backup old /etc/mcollective/client.cfg
+mv /etc/mcollective/server.cfg /etc/mcollective/server.cfg.orig
+
+# Write a new /etc/mcollective/server.cfg
+#
+cat <<EOF > /etc/mcollective/server.cfg
+topicprefix = /topic/
+main_collective = mcollective
+collectives = mcollective
+libdir = /usr/libexec/mcollective
+logfile = /var/log/mcollective.log
+loglevel = debug
+daemonize = 1
+direct_addressing = n
+
+# Plugins
+securityprovider = psk
+plugin.psk = unset
+connector = qpid
+plugin.qpid.host=${ose_broker}
+plugin.qpid.secure=false
+plugin.qpid.timeout=5
+
+# Facts
+factsource = yaml
+plugin.yaml = /etc/mcollective/facts.yaml
+EOF
+
+${ose_domain}
+${my_hostname}
+${public_ip}
+
+sed -i "s/PUBLIC_IP='127.0.0.1'/PUBLIC_IP='${public_ip}'/g" /etc/stickshift/stickshift-node.conf
+sed -i "s/CLOUD_DOMAIN=\"example.com\"/CLOUD_DOMAIN=\"${ose_domain}\"/g" /etc/stickshift/stickshift-node.conf
+sed -i "s/PUBLIC_HOSTNAME='localhost.localdomain'/PUBLIC_HOSTNAME='${my_hostname}'/g" /etc/stickshift/stickshift-node.conf
+sed -i "s/BROKER_HOST=\"localhost\"/BROKER_HOST=\"${ose_broker}\"/g" /etc/stickshift/stickshift-node.conf
+
+# Facter generates metadata files for MCollective and is normally run by cron. Run facter now to make the initial database and ensure that it runs properly: 
+/etc/cron.minutely/stickshift-facts
+
+# Reboot for good measure, turn off audrey before we do
+chkconfig ZZaudrey off
+reboot
+
+
+) 2>&1 | tee /var/audrey/tooling/openshift_node.log

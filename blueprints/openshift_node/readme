@@ -1,0 +1,9 @@
+### 
+# OpenShift Node Application Blueprint
+###
+
+1. Build the openshift node images via katello
+
+2. Add the services to your application blueprint
+
+3. Make minor edits to services for your environment

@@ -1,0 +1,24 @@
+###############################################
+# Requirements for openshift_broker blueprint #
+###############################################
+
+image:
+ operating_system: RHEL 6.3 x86_64
+  packages:
+   package: httpd-2.0 
+   package: mcollective
+   package: mcollective-qpid-plugin
+   package: mongodb
+   package: openshiftbroker
+   package: qpid-cpp-server
+   package: rhc
+   package: rubygem-gearchanger-mcollective-plugin
+   package: rubygem-swingshift-mongo-plugin
+   package: rubygem-trollop
+   package: rubygem-uplift-bind-plugin
+   package: stickshift-broker
+services:
+  service: services/openshift_broker
+
+
+

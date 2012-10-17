@@ -1,0 +1,22 @@
+#############################################
+# Requirements for openshift_node blueprint #
+#############################################
+
+image:
+ operating_system: RHEL 6.3 x86_64
+  packages:
+   package: cartridge-cron-1.4
+   package: cartridge-nodejs-0.6
+   package: cartridge-php-5.3
+   package: mcollective
+   package: mcollective-client
+   package: mcollective-qpid-plugin
+   package: mongodb
+   package: rubygem-passenger-native
+   package: rubygem-stickshift-node
+   package: stickshift-mcollective-agent
+services:
+  service: services/openshift_node
+
+
+

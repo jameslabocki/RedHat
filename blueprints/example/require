@@ -1,0 +1,11 @@
+######################################
+# Requirements for example blueprint #
+######################################
+
+---
+operating_system: RHEL 6.3 x86_64
+packages:
+  package: httpd-2.0 
+services:
+  service: register_to_system_engine
+

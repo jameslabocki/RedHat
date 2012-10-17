@@ -1,0 +1,22 @@
+       <services>
+        <service name="openshift_broker">
+          <executable url="http://172.16.0.50/RedHat/scripts/openshift_broker"/>
+          <parameters>
+            <parameter name="admin_password">
+              <value><![CDATA[secretsauce]]></value>
+            </parameter>
+            <parameter name="developer">
+              <value><![CDATA[joe]]></value>
+            </parameter>
+            <parameter name="developer_password">
+              <value><![CDATA[opensource]]></value>
+            </parameter>
+            <parameter name="ose_domain">
+              <value><![CDATA[rhc.lab.eng.bos.redhat.com]]></value>
+            </parameter>
+            <parameter name="name_server">
+              <value><![CDATA[ns1.rhc.lab.eng.bos.redhat.com]]></value>
+            </parameter>
+          </parameters>
+        </service>
+      </services>
