@@ -1,0 +1,10 @@
+       <services>
+        <service name="puppet_enterprise_agent">
+          <executable url="http://rhc-02.lab.eng.bos.redhat.com/pub/RedHat/scripts/puppet_enterprise_agent"/>
+          <parameters>
+            <parameter name="puppet_master">
+              <value><![CDATA[unused]]></value>
+            </parameter>
+          </parameters>
+        </service>
+      </services>
