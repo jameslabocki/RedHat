@@ -1,0 +1,224 @@
+#!/bin/bash -x
+(
+
+# This script will configure a system as a openshift node.
+# 
+# Author: jlabocki@redhat.com
+# Date:   10.15.12
+# reference blueprint: /RedHat/blueprints/openshift_node
+#
+# Note that variables are mapped hard to application blueprints
+#
+# For example if the following parameter was in your application blueprint:
+#       <services>
+#        <service name="register_to_system_engine">
+#          <executable url="http://172.16.0.50/test.sh"/>
+#          <parameters>
+#            <parameter name="sehost">
+#              <value><![CDATA[systemengineFQDN]]></value>
+#            </parameter>
+#          </parameters>
+#        </service>
+#      </services>
+# Then you would reference it in your script like this:
+#  sehost=$AUDREY_VAR_register_to_system_engine_sehost
+#  echo "sehost: " $sehost
+
+# Set Variables from Audrey and hide some from the user
+
+# OpenShift Broker we should register to
+ose_broker=$AUDREY_VAR_openshift_node_ose_broker
+
+# OpenShift Broker IP Address
+ose_broker_ip=$AUDREY_VAR_openshift_node_ose_broker_ip
+
+# The domain
+ose_domain=$AUDREY_VAR_openshift_node_ose_domain
+
+# The Hostname
+ose_hostname=$AUDREY_VAR_Register_with_System_Engine_hostname
+
+# The Node Name minus fqdn
+node=$( echo "$ose_hostname"|cut -d\. -f1)
+
+# DNS server
+name_server=$AUDREY_VAR_openshift_node_name_server
+
+# Setting keyfile variable
+keyfile=/var/named/${ose_domain}.key
+
+# Set the node ip
+node_ip=$(ifconfig  | grep 'inet addr:'| grep -v '127.0.0.1' | cut -d: -f2 | awk '{ print $1}')
+
+# Setting Hostname
+sed -i -e "s/HOSTNAME=.*$/HOSTNAME=${ose_hostname}/" /etc/sysconfig/network
+hostname ${ose_hostname}
+
+# Creating a node DNS record on broker using expect
+cat <<EOF > /tmp/run-dns.expect
+#!/usr/bin/expect
+        spawn ssh -oStrictHostKeyChecking=no root@broker.cloudtest.uspto.gov oo-register-dns -h ${node} -d ${ose_domain} -n ${node_ip} -k ${keyfile}
+	expect "password"
+	send "redhat\r"
+	expect eof
+EOF
+
+# Add +x to scp.expect script
+chmod +x /tmp/run-dns.expect
+
+# Run scp.expect script to retrieve ssh keys from broker
+/tmp/run-dns.expect
+
+# Clean up expect script
+rm -f /tmp/run-dns.expect
+
+# Configure SSH keys on node host from broker using expect
+cat <<EOF > /tmp/scp.expect
+#!/usr/bin/expect
+        spawn scp -oStrictHostKeyChecking=no root@broker.cloudtest.uspto.gov:/etc/openshift/rsync_id_rsa.pub /root/.ssh
+	expect "password"
+	send "redhat\r"
+	expect eof
+EOF
+
+# Add +x to scp.expect script
+chmod +x /tmp/scp.expect
+
+# Run scp.expect script to retrieve ssh keys from broker
+/tmp/scp.expect
+
+# Configure SSH keys on node host
+cat /root/.ssh/rsync_id_rsa.pub >> /root/.ssh/authorized_keys
+rm -f /root/.ssh/rsync_id_rsa.pub
+rm -f /tmp/scp.expect
+
+# Edit the /etc/resolv.conf file 
+echo DNS1=${ose_broker_ip} >> /etc/sysconfig/network-scripts/ifcfg-eth0
+sed -i -e "s/nameserver .*$/nameserver ${ose_broker_ip}/" /etc/resolv.conf
+
+# Configure DHCP on the Broker
+echo <<EOF > /etc/dhcp/dhclient-eth0.conf
+prepend domain-name-servers ${broker_ip};
+supersede host-name "node";
+supersede domain-name "cloudtest.uspto.gov";
+EOF
+
+# Backup old /etc/mcollective/client.cfg
+mv /etc/mcollective/server.cfg /etc/mcollective/server.cfg.orig
+
+# Write a new /etc/mcollective/server.cfg
+#
+cat <<EOF > /etc/mcollective/server.cfg
+topicprefix = /topic/
+main_collective = mcollective
+collectives = mcollective
+libdir = /usr/libexec/mcollective
+logfile = /var/log/mcollective.log
+loglevel = debug
+daemonize = 1
+direct_addressing = n
+registerinterval = 30
+
+# Plugins
+securityprovider = psk
+plugin.psk = unset
+connector = stomp
+plugin.stomp.host=${ose_broker}
+plugin.stomp.secure=false
+plugin.stomp.timeout=5
+plugin.stomp.port=61613
+plugin.stomp.user = mcollective
+plugin.stomp.password = redhat
+
+# Facts
+factsource = yaml
+plugin.yaml = /etc/mcollective/facts.yaml
+EOF
+
+# Set mcollective to start on boot
+chkconfig mcollective on
+
+# Start mcollective 
+service mcollective start
+
+# Configure required services for Node Host
+lokkit --service=ssh
+lokkit --service=https
+lokkit --service=http
+chkconfig httpd on
+chkconfig network on
+chkconfig sshd on
+
+# Configuring PAM
+sed -i -e 's|pam_selinux|pam_openshift|g' /etc/pam.d/sshd
+
+for f in "runuser" "runuser-l" "sshd" "su" "system-auth-ac"; \
+do t="/etc/pam.d/$f"; \
+if ! grep -q "pam_namespace.so" "$t"; \
+then echo -e "session\t\trequired\tpam_namespace.so no_unmount_on_close" >> "$t" ; \
+fi; \
+done;
+
+# Configuring CGroups
+mv /etc/cgconfig.conf /etc/cgconfig.conf.orig
+cp -f /usr/share/doc/rubygem-openshift-origin-node-*/cgconfig.conf /etc/cgconfig.conf
+restorecon -v /etc/cgconfig.conf
+mkdir /cgroup
+restorecon -v /cgroup
+chkconfig cgconfig on
+chkconfig cgred on
+chkconfig openshift-cgroups on
+service cgconfig restart
+service cgred restart
+service openshift-cgroups start
+
+# Enabling Disk Quotas
+sed -i '0,/defaults/s/defaults/defaults,usrquota/' /etc/fstab
+mount -o remount /
+quotacheck -cmug /
+
+# Configure SELinux
+setsebool -P httpd_unified=on httpd_can_network_connect=on httpd_can_network_relay=on httpd_read_user_content=on httpd_enable_homedirs=on httpd_run_stickshift=on allow_polyinstantiation=on
+
+# Correct SELinux contexts
+fixfiles -R rubygem-passenger restore
+fixfiles -R mod_passenger restore
+restorecon -rv /var/run
+restorecon -rv /usr/share/rubygems/gems/passenger-*
+restorecon -rv /usr/sbin/mcollectived /var/log/mcollective.log /var/run/mcollectived.pid
+restorecon -rv /var/lib/openshift /etc/openshift/node.conf /etc/httpd/conf.d/openshift
+
+# Configure sysctl settings
+echo '/sbin/sysctl -w kernel.sem="250  32000 32  4096"' >> /etc/rc.local
+echo '/sbin/sysctl -w net.ipv4.ip_local_port_range="15000 35530"' >> /etc/rc.local
+echo '/sbin/sysctl -w net.netfilter.nf_conntrack_max="1048576"' >> /etc/rc.local
+sysctl -p /etc/sysctl.conf
+
+# Append GIT_SSH Environment to sshd_config
+sed -i "/AcceptEnv XMODIFIERS/a  AcceptEnv GIT_SSH" /etc/ssh/sshd_config
+
+# The SSH server handles a high number of SSH connections from developers connecting to the node to push their changes. To accommodate this volume, increase the limits on the number of connections to the node by running the following commands: 
+perl -p -i -e "s/^#MaxSessions .*$/MaxSessions 40/" /etc/ssh/sshd_config
+perl -p -i -e "s/^#MaxStartups .*$/MaxStartups 40/" /etc/ssh/sshd_config
+
+# Configure OpenShift Port Proxy
+lokkit --port=35531-65535:tcp
+chkconfig openshift-port-proxy on
+service openshift-port-proxy start
+chkconfig openshift-gears on
+
+# Configure Node Settings
+sed -i "s/PUBLIC_IP=\"127.0.0.1\"/PUBLIC_IP=\"${node_ip}\"/g" /etc/openshift/node.conf
+sed -i "s/CLOUD_DOMAIN=\"example.com\"/CLOUD_DOMAIN=\"${ose_domain}\"/g" /etc/openshift/node.conf
+sed -i "s/PUBLIC_HOSTNAME=\"please.set.node.public-hostname.fqdn\"/PUBLIC_HOSTNAME=\"${ose_hostname}\"/g" /etc/openshift/node.conf
+sed -i "s/BROKER_HOST=\"localhost\"/BROKER_HOST=\"${ose_broker}\"/g" /etc/openshift/node.conf
+
+# Update Facter Database
+/etc/cron.minutely/openshift-facts
+
+# Reboot for good measure, turn off audrey before we do
+chkconfig ZZaudrey off
+reboot
+
+
+) 2>&1 | tee /var/audrey/tooling/openshift_node.log

@@ -1,0 +1,49 @@
+       
+      <services>
+        <service name="Register_with_System_Engine">
+          <executable url="http://<your-system-engine>/pub/RedHat/scripts/register_se.sh"/>
+          <parameters>
+           <parameter name="hostname">
+              <value><![CDATA[Enter Hostname]]></value>
+            </parameter>
+           <parameter name="sehost" type="scalar">
+             <value><![CDATA[<SE Hostname>]]></value>
+           </parameter>
+           <parameter name="org" type="scalar">
+             <value><![CDATA[ORG]]></value>
+           </parameter>
+           <parameter name="environment" type="scalar">
+             <value><![CDATA[Dev]]></value>
+           </parameter>
+           <parameter name="username" type="scalar">
+             <value><![CDATA[admin]]></value>
+           </parameter>
+           <parameter name="password" type="password">
+             <value><![CDATA[admin]]></value>
+           </parameter>
+           </parameters>
+        </service>
+        <service name="openshift_broker">
+          <executable url="http://<your-system-engine>/pub/RedHat/scripts/openshift_broker"/>
+          <parameters>
+            <parameter name="admin_password">
+              <value><![CDATA[redhat]]></value>
+            </parameter>
+            <parameter name="developer">
+              <value><![CDATA[joe]]></value>
+            </parameter>
+            <parameter name="developer_password">
+              <value><![CDATA[redhat]]></value>
+            </parameter>
+            <parameter name="ose_domain">
+              <value><![CDATA[domain]]></value>
+            </parameter>
+            <parameter name="name_server">
+              <value><![CDATA[IP NameServer]]></value>
+            </parameter>
+            <parameter name="hostname">
+              <value><![CDATA[Enter Hostname]]></value>
+            </parameter>
+          </parameters>
+        </service>
+      </services>

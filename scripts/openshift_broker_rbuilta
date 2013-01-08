@@ -1,0 +1,513 @@
+#!/bin/bash -x
+(
+
+# This script will configure a system as a openshift broker. 
+# 
+# Author: jlabocki@redhat.com
+# Date:   10.15.12
+# reference blueprint: /RedHat/blueprints/openshift_broker
+#
+# Note that variables are mapped hard to application blueprints
+#
+# For example if the following parameter was in your application blueprint:
+#       <services>
+#        <service name="register_to_system_engine">
+#          <executable url="http://172.16.0.50/test.sh"/>
+#          <parameters>
+#            <parameter name="sehost">
+#              <value><![CDATA[systemengineFQDN]]></value>
+#            </parameter>
+#          </parameters>
+#        </service>
+#      </services>
+# Then you would reference it in your script like this:
+#  sehost=$AUDREY_VAR_register_to_system_engine_sehost
+#  echo "sehost: " $sehost
+
+# Set Variables from Audrey and hide some from the user
+env
+
+# Developer user and password
+ose_developer=$AUDREY_VAR_openshift_broker_developer
+ose_developer_password=$AUDREY_VAR_openshift_broker_developer_password
+
+# The administrator password for the administrative user created in mongodb
+admin_password=$AUDREY_VAR_openshift_broker_admin_password
+
+# DNS server
+name_server=$AUDREY_VAR_openshift_broker_name_server
+
+# The domain
+ose_domain=$AUDREY_VAR_openshift_broker_ose_domain
+domain=${ose_domain}
+
+# Path to bind key file, we won't expose this to the user
+keyfile=/var/named/${domain}.key
+
+# The Hostname
+ose_hostname=$AUDREY_VAR_Register_with_System_Engine_hostname
+
+# The localhost IP
+localhost_ip=127.0.0.1
+
+# Edit the /etc/sysconfig/network file verify HOSTNAME
+sed -i -e "s/HOSTNAME=.*$/HOSTNAME=${ose_hostname}/" /etc/sysconfig/network
+
+# Commandline hostname command verify
+hostname ${ose_hostname}
+
+# Set the broker_ip
+broker_ip=$(ifconfig  | grep 'inet addr:'| grep -v '127.0.0.1' | cut -d: -f2 | awk '{ print $1}')
+
+# Creating DNSSEC key
+rm -vf /var/named/K${domain}*
+pushd /var/named
+dnssec-keygen -a HMAC-MD5 -b 512 -n USER -r /dev/urandom ${domain}
+KEY="$(grep Key: K${domain}*.private | cut -d ' ' -f 2)"
+popd
+
+# Enabling communication between BIND and Broker
+rndc-confgen -a -r /dev/urandom
+
+# Configuring SELinux context for key
+restorecon -v /etc/rndc.* /etc/named.*
+chown -v root:named /etc/rndc.key
+chmod -v 640 /etc/rndc.key
+
+# Adding /var/named/forwarders.conf file
+cat <<EOF > /var/named/forwarders.conf
+forwarders { ${name_server}; } ;
+EOF
+
+# Configuring Ownership/Permissions for forwarders.conf
+restorecon -v /var/named/forwarders.conf
+chmod -v 755 /var/named/forwarders.conf
+
+# Configure Subdomain Host Name Resolution
+rm -rvf /var/named/dynamic
+mkdir -vp /var/named/dynamic
+
+cat <<EOF > /var/named/dynamic/${domain}.db
+\$ORIGIN .
+\$TTL 1	; 1 seconds (for testing only)
+${domain}		IN SOA	ns1.${domain}. hostmaster.${domain}. (
+				2011112904 ; serial
+				60         ; refresh (1 minute)
+				15         ; retry (15 seconds)
+				1800       ; expire (30 minutes)
+				10         ; minimum (10 seconds)
+				)
+			NS	ns1.${domain}.
+			MX	10 mail.${domain}.
+\$ORIGIN ${domain}.
+ns1			A	127.0.0.1
+EOF
+
+# Install the DNSSEC key for domain
+cat <<EOF > /var/named/${domain}.key
+key ${domain} {
+  algorithm HMAC-MD5;
+  secret "${KEY}";
+};
+EOF
+
+# Set permissions/context for DNSSEC key
+chown -Rv named:named /var/named
+restorecon -rv /var/named
+
+# Create new /etc/named.conf file
+cat <<EOF > /etc/named.conf
+// named.conf
+//
+// Provided by Red Hat bind package to configure the ISC BIND named(8) DNS
+// server as a caching only nameserver (as a localhost DNS resolver only).
+//
+// See /usr/share/doc/bind*/sample/ for example named configuration files.
+//
+
+options {
+	listen-on port 53 { any; };
+	directory 	"/var/named";
+	dump-file 	"/var/named/data/cache_dump.db";
+        statistics-file "/var/named/data/named_stats.txt";
+        memstatistics-file "/var/named/data/named_mem_stats.txt";
+	allow-query     { any; };
+	recursion yes;
+
+	/* Path to ISC DLV key */
+	bindkeys-file "/etc/named.iscdlv.key";
+
+	// set forwarding to the next nearest server (from DHCP response
+	forward only;
+        include "forwarders.conf";
+};
+
+logging {
+        channel default_debug {
+                file "data/named.run";
+                severity dynamic;
+        };
+};
+
+// use the default rndc key
+include "/etc/rndc.key";
+
+controls {
+	inet 127.0.0.1 port 953
+	allow { 127.0.0.1; } keys { "rndc-key"; };
+};
+
+include "/etc/named.rfc1912.zones";
+
+include "${domain}.key";
+
+zone "${domain}" IN {
+	type master;
+	file "dynamic/${domain}.db";
+	allow-update { key ${domain} ; } ;
+};
+EOF
+
+# Set permissions and context for /etc/named.conf file
+chown -v root:named /etc/named.conf
+restorecon /etc/named.conf
+
+# Edit the /etc/resolv.conf
+echo DNS1=${broker_ip} >> /etc/sysconfig/network-scripts/ifcfg-eth0
+sed -i -e "s/nameserver .*$/nameserver 127.0.0.1/" /etc/resolv.conf
+
+# Allow DNS access through firewall
+lokkit --service=dns
+
+# Configure DNS to start on boot and start now
+chkconfig named on
+service named start
+
+# Adding broker to DNS
+/usr/sbin/oo-register-dns -h broker -d cloudtest.uspto.gov -n ${broker_ip} -k ${keyfile}
+
+# Edit the /etc/dhcp/dhclient-eth0.conf adding the following lines
+cat <<EOF > /etc/dhcp/dhclient-eth0.conf
+prepend domain-name-servers ${broker_ip};
+supersede host-name "broker";
+supersede domain-name "cloudtest.uspto.gov";
+EOF
+
+# Edit /etc/mongodb.conf to require authentication
+echo "smallfiles = true" >> /etc/mongodb.conf
+echo "auth = true" >> /etc/mongodb.conf
+
+# Enable mongod services at boot
+chkconfig mongod on
+
+# Start mongod service
+service mongod start
+
+# sleep while mongo starts
+sleep 50
+
+# Backup the original /etc/activemq/activemq.xml file -> /etc/activemq/activemq.xml.orig
+mv /etc/activemq/activemq.xml /etc/activemq/activemq.xml.orig
+
+# Add new /etc/activemq/activemq.xml file with users and stomp port included
+cat <<'EOF' > /etc/activemq/activemq.xml
+<!--
+    Licensed to the Apache Software Foundation (ASF) under one or more
+    contributor license agreements.  See the NOTICE file distributed with
+    this work for additional information regarding copyright ownership.
+    The ASF licenses this file to You under the Apache License, Version 2.0
+    (the "License"); you may not use this file except in compliance with
+    the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
+-->
+<!-- START SNIPPET: example -->
+<beans
+  xmlns="http://www.springframework.org/schema/beans"
+  xmlns:amq="http://activemq.apache.org/schema/core"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans-2.0.xsd
+  http://activemq.apache.org/schema/core http://activemq.apache.org/schema/core/activemq-core.xsd">
+
+    <!-- Allows us to use system properties as variables in this configuration file -->
+    <bean class="org.springframework.beans.factory.config.PropertyPlaceholderConfigurer">
+        <property name="locations">
+            <value>file:${activemq.conf}/credentials.properties</value>
+        </property>
+    </bean>
+
+    <!--
+        The <broker> element is used to configure the ActiveMQ broker.
+    -->
+    <broker xmlns="http://activemq.apache.org/schema/core" brokerName="localhost" dataDirectory="${activemq.data}">
+
+        <!--
+            For better performances use VM cursor and small memory limit.
+            For more information, see:
+
+            http://activemq.apache.org/message-cursors.html
+
+            Also, if your producer is "hanging", it's probably due to producer flow control.
+            For more information, see:
+            http://activemq.apache.org/producer-flow-control.html
+        -->
+
+        <destinationPolicy>
+            <policyMap>
+              <policyEntries>
+                <policyEntry topic=">" producerFlowControl="true" memoryLimit="1mb">
+                  <pendingSubscriberPolicy>
+                    <vmCursor />
+                  </pendingSubscriberPolicy>
+                </policyEntry>
+                <policyEntry queue=">" producerFlowControl="true" memoryLimit="1mb">
+                  <!-- Use VM cursor for better latency
+                       For more information, see:
+
+                       http://activemq.apache.org/message-cursors.html
+
+                  <pendingQueuePolicy>
+                    <vmQueueCursor/>
+                  </pendingQueuePolicy>
+                  -->
+                </policyEntry>
+              </policyEntries>
+            </policyMap>
+        </destinationPolicy>
+
+
+        <!--
+            The managementContext is used to configure how ActiveMQ is exposed in
+            JMX. By default, ActiveMQ uses the MBean server that is started by
+            the JVM. For more information, see:
+
+            http://activemq.apache.org/jmx.html
+        -->
+        <managementContext>
+            <managementContext createConnector="false"/>
+        </managementContext>
+
+<!--  add users for mcollective  -->
+<plugins>
+<statisticsBrokerPlugin/>
+<simpleAuthenticationPlugin>
+<users>
+<authenticationUser username="mcollective" password="marionette" groups="mcollective,everyone"/>
+<authenticationUser username="admin" password="secret" groups="mcollective,admin,everyone"/>
+</users>
+</simpleAuthenticationPlugin>
+<authorizationPlugin>
+<map>
+<authorizationMap>
+<authorizationEntries>
+<authorizationEntry queue=">" write="admins" read="admins" admin="admins"/>
+<authorizationEntry topic=">" write="admins" read="admins" admin="admins"/>
+<authorizationEntry topic="mcollective.>" write="mcollective" read="mcollective" admin="mcollective"/>
+<authorizationEntry queue="mcollective.>" write="mcollective" read="mcollective" admin="mcollective"/>
+<authorizationEntry topic="ActiveMQ.Advisory.>" read="everyone" write="everyone" admin="everyone"/>
+</authorizationEntries>
+</authorizationMap>
+</map>
+</authorizationPlugin>
+</plugins>
+
+        <!--
+            Configure message persistence for the broker. The default persistence
+            mechanism is the KahaDB store (identified by the kahaDB tag).
+            For more information, see:
+
+            http://activemq.apache.org/persistence.html
+        -->
+        <persistenceAdapter>
+            <kahaDB directory="${activemq.data}/kahadb"/>
+        </persistenceAdapter>
+
+
+          <!--
+            The systemUsage controls the maximum amount of space the broker will
+            use before slowing down producers. For more information, see:
+            http://activemq.apache.org/producer-flow-control.html
+            If using ActiveMQ embedded - the following limits could safely be used:
+
+        <systemUsage>
+            <systemUsage>
+                <memoryUsage>
+                    <memoryUsage limit="20 mb"/>
+                </memoryUsage>
+                <storeUsage>
+                    <storeUsage limit="1 gb"/>
+                </storeUsage>
+                <tempUsage>
+                    <tempUsage limit="100 mb"/>
+                </tempUsage>
+            </systemUsage>
+        </systemUsage>
+        -->
+          <systemUsage>
+            <systemUsage>
+                <memoryUsage>
+                    <memoryUsage limit="64 mb"/>
+                </memoryUsage>
+                <storeUsage>
+                    <storeUsage limit="100 gb"/>
+                </storeUsage>
+                <tempUsage>
+                    <tempUsage limit="50 gb"/>
+                </tempUsage>
+            </systemUsage>
+        </systemUsage>
+
+        <!--
+            The transport connectors expose ActiveMQ over a given protocol to
+            clients and other brokers. For more information, see:
+
+            http://activemq.apache.org/configuring-transports.html
+        -->
+        <transportConnectors>
+            <transportConnector name="openwire" uri="tcp://0.0.0.0:61616"/>
+	    <transportConnector name="stomp" uri="stomp://0.0.0.0:61613"/>
+        </transportConnectors>
+
+    </broker>
+
+    <!--
+        Enable web consoles, REST and Ajax APIs and demos
+
+        Take a look at ${ACTIVEMQ_HOME}/conf/jetty.xml for more details
+    -->
+    <import resource="jetty.xml"/>
+
+</beans>
+<!-- END SNIPPET: example -->
+EOF
+
+# Edit the /etc/activemq/activemq.xml and adding the following lines - also replacing 'localhost' with ${broker_hostname}
+sed -i -e "s/localhost/`hostname`/" /etc/activemq/activemq.xml
+
+# Edit the /etc/activemq/activemq/xml and replace the default passwords
+sed -i -e "s/marionette/${admin_password}/" /etc/activemq/activemq.xml
+sed -i -e "s/secret/${admin_password}/" /etc/activemq/activemq.xml
+
+# Open activemq port on firewall
+lokkit --port=61613:tcp
+
+# Eanble activemq service at boot
+chkconfig activemq on
+
+# Start activemq service
+service activemq start
+
+# Securing the activemq console
+sed -i -e '/name="authenticate"/s/false/true/' /etc/activemq/jetty.xml
+sed -i -e "s/admin: .*$/admin:${admin_password}, admin/" /etc/activemq/jetty-realm.properties
+#sed -i -e "/admin:/s/admin,/$(admin_password),/" /etc/activemq/jetty-realm.properties
+
+# Backup old /etc/mcollective/client.cfg
+mv /etc/mcollective/client.cfg /etc/mcollective/client.cfg.orig
+
+# Write a new /etc/mcollective/client.cfg
+cat <<EOF > /etc/mcollective/client.cfg
+topicprefix = /topic/
+main_collective = mcollective
+collectives = mcollective
+libdir = /usr/libexec/mcollective
+loglevel = debug
+logfile = /var/log/mcollective-client.log
+
+# Plugins
+securityprovider = psk
+plugin.psk = unset
+connector = stomp
+plugin.stomp.host=${ose_hostname}
+plugin.stomp.port = 61613
+plugin.stomp.user = mcollective
+plugin.stomp.password = redhat
+plugin.stomp.secure=false
+plugin.stomp.timeout=5
+EOF
+
+# Configure broker proxy server name
+sed -i -e "s/ServerName .*$/ServerName `hostname`/" /etc/httpd/conf.d/000000_openshift_origin_broker_proxy.conf
+
+# Configuring required services
+chkconfig httpd on
+chkconfig network on
+chkconfig ntpd on
+chkconfig sshd on
+
+# Configure required firewall services
+lokkit --service=ssh
+lokkit --service=https
+lokkit --service=http
+
+# Configuring inter-host access keys
+openssl genrsa -out /etc/openshift/server_priv.pem 2048
+openssl rsa -in /etc/openshift/server_priv.pem -pubout > /etc/openshift/server_pub.pem
+ssh-keygen -t rsa -b 2048 -N '' -f ~/.ssh/rsync_id_rsa
+cp ~/.ssh/rsync_id_rsa* /etc/openshift/
+
+# Configure standard SELinux Boolean variables
+setsebool -P httpd_unified=on httpd_can_network_connect=on httpd_can_network_relay=on httpd_run_stickshift=on named_write_master_zones=on allow_ypbind=on
+
+# Set selinux contexts
+fixfiles -R rubygem-passenger restore
+fixfiles -R mod_passenger restore
+restorecon -rv /var/run
+restorecon -rv /usr/share/rubygems/gems/passenger-*
+
+# Configure OpenShift Enterprise Broker Domain
+sed -i -e "s/^CLOUD_DOMAIN=.*$/CLOUD_DOMAIN=${ose_domain}/" /etc/openshift/broker.conf
+
+# Change the admin password in /etc/openshift/broker.conf
+sed -i -e "s/mooo/${admin_password}/" /etc/openshift/broker.conf
+
+# Configure OpenShift Enterprise Plug-ins
+cd /etc/openshift/plugins.d
+cp openshift-origin-auth-remote-user.conf.example openshift-origin-auth-remote-user.conf
+cp openshift-origin-msg-broker-mcollective.conf.example openshift-origin-msg-broker-mcollective.conf
+
+# Configure the DNS-Bind plug-in
+cat << EOF > openshift-origin-dns-bind.conf
+BIND_SERVER="${localhost_ip}"
+BIND_PORT=53
+BIND_KEYNAME="${ose_domain}"
+BIND_KEYVALUE="${KEY}"
+BIND_ZONE="${ose_domain}"
+EOF
+
+# Compile the selinux policy for dns-bind
+pushd /usr/share/selinux/packages/rubygem-openshift-origin-dns-bind/ && make -f /usr/share/selinux/devel/Makefile ; popd
+semodule -i /usr/share/selinux/packages/rubygem-openshift-origin-dns-bind/dhcpnamedforward.pp
+
+# Configure OpenShift Enterprise Authentication
+cp /var/www/openshift/broker/httpd/conf.d/openshift-origin-auth-remote-user-basic.conf.sample /var/www/openshift/broker/httpd/conf.d/openshift-origin-auth-remote-user.conf
+
+# Create htpasswd file with user
+htpasswd -cb /etc/openshift/htpasswd ${ose_developer} ${ose_developer_password}
+
+# Configure mongo user accounts
+mongo openshift_broker_dev --eval "db.addUser('openshift', '$admin_password')"
+
+# Configure Bundler
+cd /var/www/openshift/broker
+bundle --local
+
+# Configure broker to start on boot
+chkconfig openshift-broker on
+
+# Start broker
+service httpd start
+service openshift-broker start
+
+# Reboot for good measure, turn off audrey before we do
+chkconfig ZZaudrey off
+reboot
+
+
+) 2>&1 | tee /var/audrey/tooling/openshift_broker.log
