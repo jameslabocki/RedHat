@@ -1,0 +1,26 @@
+###############################################
+# Requirements for openshift_broker_rbuilta blueprint #
+###############################################
+
+image:
+ operating_system: RHEL 6.3 x86_64
+packages:
+  package: mcollective-client
+  package: activemq 
+  package: rhev-agent 
+  package: aeolus-audrey-agent 
+  package: katello-agent 
+  package: mongodb-server 
+  package: activemq-client 
+  package: openshift-origin-broker 
+  package: openshift-origin-broker-util 
+  package: rubygem-openshift-origin-auth-remote-user 
+  package: rubygem-openshift-origin-msg-broker-mcollective 
+  package: rubygem-openshift-origin-dns-bind 
+  package: expect 
+  packages:
+services:
+  service: services/openshift_broker_rbuilta
+
+
+
